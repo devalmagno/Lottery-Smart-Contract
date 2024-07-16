@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.19;
 
-import {Test} from "forge-std/Test.sol";
+import {Test, console} from "forge-std/Test.sol";
 import {DeployRaffle} from "../../script/DeployRaffle.s.sol";
-import {HelperConfig} from "../../script/HelperConfig.s.sol";
+import {HelperConfig, CodeConstants} from "../../script/HelperConfig.s.sol";
 import {Raffle} from "../../src/Raffle.sol";
+import {Vm} from "forge-std/Vm.sol";
+import {VRFCoordinatorV2_5Mock} from "@chainlink/contracts/v0.8/vrf/mocks/VRFCoordinatorV2_5Mock.sol";
 
-contract RaffleTest is Test {
+contract RaffleTest is Test, CodeConstants {
     Raffle public raffle;
     HelperConfig public helperConfig;
 
@@ -23,15 +25,21 @@ contract RaffleTest is Test {
     event RaffleEntered(address indexed player);
     event WinnerPicked(address indexed player);
 
-    modifier enteredRaffle() {
+    modifier playerEntered() {
         vm.prank(i_player);
         raffle.enterRaffle{value: s_entranceFee}();
         _;
     }
 
     modifier timePassed() {
-        vm.warp(block.timestamp + s_interval + 1);
-        vm.roll(block.number + 1);
+        advanceTimeAndBlock();
+        _;
+    }
+
+    modifier skipFork() {
+        if (block.chainid != LOCAL_CHAIN_ID) {
+            return;
+        }
         _;
     }
 
@@ -64,7 +72,7 @@ contract RaffleTest is Test {
         raffle.enterRaffle{value: 0}();
     }
 
-    function testRaffleRecordsPlayersWhenTheyEnter() public enteredRaffle {
+    function testRaffleRecordsPlayersWhenTheyEnter() public playerEntered {
         address playerRecorded = raffle.getPlayer(0);
 
         assert(i_player == playerRecorded);
@@ -81,7 +89,7 @@ contract RaffleTest is Test {
 
     function testDontAllowPlayersToEnterWhileRaffleIsCalculating()
         public
-        enteredRaffle
+        playerEntered
         timePassed
     {
         raffle.performUpkeep("");
@@ -103,7 +111,7 @@ contract RaffleTest is Test {
 
     function testCheckUpKeepReturnsFalseIfRaffleIsNotOpen()
         public
-        enteredRaffle
+        playerEntered
         timePassed
     {
         raffle.performUpkeep("");
@@ -115,7 +123,7 @@ contract RaffleTest is Test {
 
     function testCheckUpkeepReturnsFalseIfEnoughTimeHasNotPassed()
         public
-        enteredRaffle
+        playerEntered
     {
         (bool upkeepNeeded, ) = raffle.checkUpKeep("");
 
@@ -124,11 +132,126 @@ contract RaffleTest is Test {
 
     function testCheckUpkeepReturnsTrueIfWhenParametersAreGood()
         public
-        enteredRaffle
+        playerEntered
         timePassed
     {
         (bool upkeepNeeded, ) = raffle.checkUpKeep("");
 
         assert(upkeepNeeded);
+    }
+
+    /*
+     * Perform Upkeep
+     */
+
+    function testIfPerformUpkeepCanOnlyRunIfUpkeepIsTrue()
+        public
+        playerEntered
+        timePassed
+    {
+        raffle.performUpkeep("");
+    }
+
+    function testPerformUpkeepRevertIfCheckUpkeepIsFalse() public {
+        uint256 currentBalance = 0;
+        uint256 numPlayers = 0;
+        Raffle.RaffleState rState = raffle.getRaffleState();
+
+        vm.prank(i_player);
+        raffle.enterRaffle{value: s_entranceFee}();
+        currentBalance += s_entranceFee;
+        numPlayers++;
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                Raffle.Raffle__UpkeepNotNeeded.selector,
+                currentBalance,
+                numPlayers,
+                rState
+            )
+        );
+        raffle.performUpkeep("");
+    }
+
+    function testPerformUpkeepUpdatesRaffleStateAndEmitsRequestId()
+        public
+        playerEntered
+        timePassed
+    {
+        vm.recordLogs();
+        raffle.performUpkeep("");
+        Vm.Log[] memory entries = vm.getRecordedLogs();
+        bytes32 requestId = entries[1].topics[1];
+
+        Raffle.RaffleState raffleState = raffle.getRaffleState();
+        assert(uint256(requestId) > 0);
+        assert(uint256(raffleState) == 1);
+    }
+
+    /*
+     * FULFILLRANDOMWORDS
+     */
+
+    function testFulfillRandomWordsCanOnlyBeCalledAfterPerformUpkeep(
+        uint256 randomRequestId
+    ) public playerEntered timePassed skipFork {
+        // Arrange / Act / Assert
+        vm.expectRevert(VRFCoordinatorV2_5Mock.InvalidRequest.selector);
+        VRFCoordinatorV2_5Mock(s_vrfCoordinator).fulfillRandomWords(
+            randomRequestId,
+            address(raffle)
+        );
+    }
+
+    function testFulfillRandomWordsPicksAWinnerResetsAndSendsMoney()
+        public
+        skipFork
+    {
+        // Arrange
+        uint160 additionalEntrance = 4;
+        uint160 startingIndex = 1;
+        address expectedWinner = address(2);
+        for (
+            uint160 i = startingIndex;
+            i < startingIndex + additionalEntrance;
+            i++
+        ) {
+            hoax(address(i), STARTING_PLAYER_BALANCE);
+            raffle.enterRaffle{value: s_entranceFee}();
+        }
+        uint256 startingTimeStamp = raffle.getLastTimeStamp();
+        uint256 winnerStartingBalance = expectedWinner.balance;
+
+        // Act
+        advanceTimeAndBlock();
+        vm.recordLogs();
+        raffle.performUpkeep("");
+        Vm.Log[] memory entries = vm.getRecordedLogs();
+        bytes32 requestId = entries[1].topics[1];
+        VRFCoordinatorV2_5Mock(s_vrfCoordinator).fulfillRandomWords(
+            uint256(requestId),
+            address(raffle)
+        );
+
+        // Assert
+        address recentWinner = raffle.getRecentWinner();
+        Raffle.RaffleState raffleState = raffle.getRaffleState();
+        uint256 winnerBalance = recentWinner.balance;
+        uint256 endingTimeStamp = raffle.getLastTimeStamp();
+        uint256 prize = s_entranceFee * additionalEntrance;
+
+        console.log("Recent Winner: ", recentWinner);
+        console.log("Expected Winner: ", expectedWinner);
+        assert(recentWinner == expectedWinner);
+        assert(uint256(raffleState) == 0);
+        assert(winnerBalance == winnerStartingBalance + prize);
+        assert(endingTimeStamp > startingTimeStamp);
+    }
+
+    /* Private Functions */
+
+    function advanceTimeAndBlock() private {
+        vm.warp(block.timestamp + s_interval + 1);
+        vm.roll(block.number + 1);
     }
 }
